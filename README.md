@@ -47,11 +47,7 @@ SHOTGUN_ORGANIZER_ID=your_organizer_id
 
 1. **Shotgun Token**:
    - Log in to your Shotgun dashboard
-   - Open developer tools (F12)
-   - Go to the **Network** tab
-   - Refresh the page
-   - Look for a request to `api.shotgun.live`
-   - In the **Headers**, you'll find `Authorization: Bearer [YOUR_TOKEN]`
+   - Go to integration > API
 
 2. **Organizer ID**:
    - Visible in your Shotgun dashboard URL
