@@ -97,61 +97,90 @@ async def get_active_events():
         return None
 
 async def get_event_stats(event_id):
-    """Fetches ticket stats for a specific event."""
+    """Fetches ticket stats for a specific event with pagination."""
     headers = {
         "Authorization": f"Bearer {SHOTGUN_TOKEN}"
     }
-    params = {
-        "organizer_id": ORGANIZER_ID,  # Added missing organizer_id
-        "event_id": event_id
+    
+    stats = {
+        'total': 0,
+        'valid': 0,
+        'scanned': 0,
+        'canceled': 0,
+        'revenue': 0.0,
+        'by_deal': {}  # Breakdown by ticket type
     }
     
     try:
-        print(f"DEBUG: Fetching tickets for event {event_id}")
-        response = requests.get(SHOTGUN_TICKETS_API, headers=headers, params=params)
-        
-        if response.status_code != 200:
-            print(f"DEBUG: Error Response: {response.text}")
-            return None
-            
-        data = response.json().get('data', [])
-        
-        stats = {
-            'total': len(data),
-            'valid': 0,
-            'scanned': 0,
-            'canceled': 0,
-            'revenue': 0.0,
-            'by_deal': {}  # Breakdown by ticket type
+        url = SHOTGUN_TICKETS_API
+        params = {
+            "organizer_id": ORGANIZER_ID,
+            "event_id": event_id,
+            "limit": 100  # Max per page
         }
         
-        for ticket in data:
-            status = ticket.get('ticket_status')
-            deal_title = ticket.get('deal_title', 'Sans nom')
-            deal_price = float(ticket.get('deal_price', 0)) / 100  # Convert cents to euros
-            
-            # Initialize deal stats if not exists
-            if deal_title not in stats['by_deal']:
-                stats['by_deal'][deal_title] = {
-                    'sold': 0,
-                    'revenue': 0.0
-                }
-            
-            # Count by status
-            if status == 'valid':
-                stats['valid'] += 1
-            elif status == 'scanned':
-                stats['scanned'] += 1
-            elif status in ['canceled', 'refunded']:
-                stats['canceled'] += 1
-                
-            # Add revenue and count for valid/scanned tickets
-            if status in ['valid', 'scanned']:
-                stats['revenue'] += deal_price
-                stats['by_deal'][deal_title]['sold'] += 1
-                stats['by_deal'][deal_title]['revenue'] += deal_price
+        page = 0
         
-        print(f"DEBUG: Event {event_id} stats: {stats}")
+        # Fetch all pages
+        while url:
+            page += 1
+            print(f"DEBUG: Fetching tickets page {page} for event {event_id}")
+            
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code != 200:
+                print(f"DEBUG: Error Response: {response.text}")
+                return None
+            
+            json_resp = response.json()
+            data = json_resp.get('data', [])
+            
+            print(f"DEBUG: Page {page}: {len(data)} tickets")
+            
+            # Process tickets
+            for ticket in data:
+                stats['total'] += 1
+                
+                status = ticket.get('ticket_status')
+                deal_title = ticket.get('deal_title', 'Sans nom')
+                deal_price = float(ticket.get('deal_price', 0)) / 100  # Convert cents to euros
+                
+                # Initialize deal stats if not exists
+                if deal_title not in stats['by_deal']:
+                    stats['by_deal'][deal_title] = {
+                        'sold': 0,
+                        'revenue': 0.0
+                    }
+                
+                # Count by status
+                if status == 'valid':
+                    stats['valid'] += 1
+                elif status == 'scanned':
+                    stats['scanned'] += 1
+                elif status in ['canceled', 'refunded']:
+                    stats['canceled'] += 1
+                    
+                # Add revenue and count for valid/scanned tickets
+                if status in ['valid', 'scanned']:
+                    stats['revenue'] += deal_price
+                    stats['by_deal'][deal_title]['sold'] += 1
+                    stats['by_deal'][deal_title]['revenue'] += deal_price
+            
+            # Check for next page
+            pagination = json_resp.get('pagination', {})
+            next_url = pagination.get('next')
+            
+            if next_url:
+                # The next_url might be a full URL or a relative path, or just query params.
+                # The documentation says "link to the next page", usually a full URL in modern APIs.
+                # If it's just the path, we might need to prepend the base URL, but usually it's full.
+                # Let's assume it's a full URL for now, or handle if it's not.
+                url = next_url
+                params = {}  # Params are usually included in the next_url
+            else:
+                url = None
+        
+        print(f"DEBUG: Event {event_id} total stats: {stats['total']} tickets across {page} page(s)")
         return stats
 
     except Exception as e:
@@ -240,6 +269,7 @@ async def event_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     detail_text += f"_Dernière mise à jour : à l'instant_"
     
     keyboard = [
+        [InlineKeyboardButton("🔄 Actualiser", callback_data=f"evt_{event_id}")],
         [InlineKeyboardButton("🔙 Liste des événements", callback_data='list_events')],
         [InlineKeyboardButton("🏠 Menu Principal", callback_data='start')]
     ]
