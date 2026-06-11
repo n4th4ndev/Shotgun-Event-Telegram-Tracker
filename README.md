@@ -18,6 +18,11 @@
   <a href="https://t.me/BotFather">🤖 BotFather</a>
 </p>
 
+<p align="center">
+  <b>🇫🇷 Français</b> ·
+  <a href="README.en.md">🇬🇧 English</a>
+</p>
+
 ---
 
 ## 📋 Fonctionnalités
