@@ -1,17 +1,22 @@
 # 🤖 Shotgun Bot - Telegram
 
-Telegram bot to track your Shotgun event sales in real-time.
+Telegram bot to track your Shotgun event sales in real-time, with a global dashboard, history of past events, and automatic push notifications on new sales.
 
 ## 📋 Features
 
-- 📅 **List active events**: Displays all your published and non-cancelled events
+- 📅 **Active events**: list all your published, launched and non-cancelled events
 - 📊 **Detailed statistics** per event:
-  - Total tickets sold
-  - Valid, scanned, and cancelled tickets
+  - Tickets sold, valid, scanned, cancelled
   - Total revenue
   - **Breakdown by ticket type** (name, quantity sold, revenue)
   - Remaining tickets available
-- 🔄 **Real-time updates**: Stats are fetched on each request
+- 📈 **Global dashboard**: aggregated view across all your active events (total sales, revenue, remaining)
+- 🕘 **History**: browse past / archived events kept in local state
+- 🔔 **Real-time notifications**: a background job polls sales and **pushes a message to subscribers** whenever tickets are sold or scanned (`+sold`, `+revenue`, `+scanned`, remaining)
+- 🩺 **Health command**: inspect cache state, subscribers, archives and TTLs
+- ⚡ **Caching layer**: short-TTL caches for events/stats plus a warm-up job to keep the API responsive
+- 🔒 **Access control**: optional allow-list of Telegram chat IDs
+- 💾 **Persistent state**: subscribers, sales snapshots and event archive stored in `bot_state.json`
 
 ## 🚀 Installation
 
@@ -35,28 +40,23 @@ Copy `.env.example` to `.env` and fill in your credentials:
 cp .env.example .env
 ```
 
-Edit the `.env` file with your keys:
+Edit the `.env` file:
 
 ```env
 TELEGRAM_BOT_TOKEN=your_telegram_token
 SHOTGUN_TOKEN=your_shotgun_token
 SHOTGUN_ORGANIZER_ID=your_organizer_id
+# Optional: comma-separated Telegram chat IDs allowed to use the bot.
+# Leave empty to allow everyone.
+BOTSHOTGUN_ALLOWED_CHAT_IDS=
 ```
 
 #### 🔑 Where to find your Shotgun credentials?
 
-1. **Shotgun Token**:
-   - Log in to your Shotgun dashboard
-   - Go to integration > API
-
-2. **Organizer ID**:
-   - Visible in your Shotgun dashboard URL
-   - Or in the JSON response of API requests
-
-3. **Telegram Token**:
-   - Talk to [@BotFather](https://t.me/BotFather)
-   - Type `/newbot` and follow instructions
-   - Copy the provided token
+1. **Shotgun Token**: log in to your Shotgun dashboard → integration > API
+2. **Organizer ID**: visible in your Shotgun dashboard URL, or in the JSON response of API requests
+3. **Telegram Token**: talk to [@BotFather](https://t.me/BotFather), type `/newbot` and follow the instructions
+4. **Allowed chat IDs** (optional): message the bot, check the logs for your chat ID, then add it to `BOTSHOTGUN_ALLOWED_CHAT_IDS`
 
 ## 🎯 Usage
 
@@ -66,18 +66,24 @@ SHOTGUN_ORGANIZER_ID=your_organizer_id
 python3 bot.py
 ```
 
-The bot starts in polling mode and waits for commands.
+The bot starts in polling mode, launches the background sales-monitor job, and waits for commands.
 
 ### Telegram commands
 
-1. Open Telegram and search for your bot
-2. Click **Start** or type `/start`
-3. Use the buttons to navigate:
-   - **📅 My Events**: List all your active events
-   - **🎉 [Event name]**: Show detailed stats
-   - **🔙 Back**: Return to previous menu
+| Command | Description |
+| --- | --- |
+| `/start` | Main menu with buttons |
+| `/dashboard` | Global aggregated stats across all active events |
+| `/recent` | List past / archived events |
+| `/notifications` | Notifications panel (subscribe status) |
+| `/subscribe` | Receive real-time sales notifications |
+| `/unsubscribe` | Stop receiving notifications |
+| `/health` | Bot diagnostics (cache, subscribers, archives, TTLs) |
+| `/help` | Help message |
 
-### Example output
+The main menu exposes the same actions as buttons: **📅 Mes Événements**, **📈 Dashboard**, **🕘 Anciens**, **🔔 Notifications**, **ℹ️ Aide**, plus a **🔄 Actualiser** button to force an API refresh.
+
+### Example: per-event detail
 
 ```
 🎉 [Event Name]
@@ -100,20 +106,27 @@ The bot starts in polling mode and waits for commands.
 🎫 Remaining tickets: 238
 ```
 
+### Example: sales notification (pushed automatically)
+
+```
+🚀 [Event Name]
+Billets vendus : +3
+Scannés : +0
+CA : +45.00 €
+Restants : 235
+```
+
 ## 🛠️ Utility scripts
 
 ### Restart the bot cleanly
 
-If you encounter conflicts (error "Conflict: terminated by other getUpdates"), use:
+If you encounter conflicts (error "Conflict: terminated by other getUpdates"):
 
 ```bash
 ./restart_bot.sh
 ```
 
-This script:
-1. Kills all bot instances
-2. Resets the Telegram webhook
-3. Restarts the bot
+This script kills any running instance of **this** bot (targeted by absolute path so it does not affect other `bot.py` processes), resets the Telegram webhook, then restarts.
 
 ### Reset webhook manually
 
@@ -121,63 +134,59 @@ This script:
 python3 reset_webhook.py
 ```
 
+## ⚙️ Configuration reference
+
+These tunables live at the top of `bot.py`:
+
+| Constant | Default | Meaning |
+| --- | --- | --- |
+| `EVENTS_CACHE_TTL` | `30s` | Events list cache lifetime |
+| `EVENT_STATS_CACHE_TTL` | `15s` | Per-event stats cache lifetime |
+| `SALES_POLL_INTERVAL` | `60s` | Background sales-monitor interval |
+| `RECENT_EVENTS_LIMIT` | `8` | Max past events shown |
+| `MAX_HTTP_RETRIES` | `3` | HTTP retry attempts |
+| `MAX_DEAL_LINES` | `12` | Max ticket-type lines per event |
+
 ## 📁 Project structure
 
 ```
-shotgunbot/
-├── bot.py                 # Main bot code
+BOTSHOTGUN/
+├── bot.py                 # Main bot code (menus, dashboard, notifications, caching)
 ├── requirements.txt       # Python dependencies
-├── .env                   # Configuration (to create)
-├── .env.example          # Configuration example
-├── reset_webhook.py      # Script to reset Telegram webhook
-├── restart_bot.sh        # Clean restart script
-└── README.md             # This file
+├── .env                   # Configuration (to create, not committed)
+├── .env.example           # Configuration example
+├── bot_state.json         # Runtime state: subscribers, snapshots, archives (not committed)
+├── reset_webhook.py       # Reset the Telegram webhook
+├── restart_bot.sh         # Clean restart script
+└── README.md              # This file
 ```
 
 ## 🔧 Troubleshooting
 
 ### Error "Conflict: terminated by other getUpdates"
-
-**Cause**: Multiple bot instances running simultaneously.
-
-**Solution**:
-1. Close all terminals
-2. Run `./restart_bot.sh`
-3. Or restart your computer
+Multiple bot instances are running. Run `./restart_bot.sh`.
 
 ### Error "Missing organizer_id"
+Token or organizer ID is incorrect. Check your `.env`.
 
-**Cause**: Token or organizer ID is incorrect.
-
-**Solution**: Check your `.env` file and ensure the values are correct.
+### "Accès non autorisé"
+Your chat ID is not in `BOTSHOTGUN_ALLOWED_CHAT_IDS`. Add it, or leave the variable empty to allow everyone.
 
 ### Incorrect prices
-
-**Cause**: Shotgun API returns prices in cents.
-
-**Solution**: The bot automatically divides by 100. If you still see issues, check the latest code version.
+The Shotgun API returns prices in cents; the bot divides by 100 automatically.
 
 ## 📡 APIs used
 
-- **Shotgun Events API**: `https://smartboard-api.shotgun.live/api/shotgun/organizers/{id}/events`
-  - Lists active events
-  
-- **Shotgun Tickets API**: `https://api.shotgun.live/tickets`
-  - Retrieves sold ticket details
+- **Shotgun Events API**: `https://smartboard-api.shotgun.live/api/shotgun/organizers/{id}/events` — lists events
+- **Shotgun Tickets API**: `https://api.shotgun.live/tickets` — retrieves sold ticket details
 
 ## 📝 Notes
 
-- The bot works in **polling mode** (no webhook)
-- Stats are fetched **on demand** (no caching)
+- Runs in **polling mode** (no webhook)
+- Stats are cached briefly (short TTLs) and refreshed on demand or by the background job
 - Prices are automatically converted from cents to euros
-- Only **published, launched, and non-cancelled** events are displayed
-
-## 🤝 Support
-
-For any questions or issues, verify:
-1. Your API keys are valid
-2. The Telegram bot is running
-3. You only have one bot instance running
+- Only **published, launched, and non-cancelled** events are listed as active
+- `bot_state.json` is runtime data — do not hand-edit unless fixing corrupted state
 
 ## 📄 License
 
