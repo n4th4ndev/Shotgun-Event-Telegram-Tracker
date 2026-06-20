@@ -782,7 +782,12 @@ def build_event_detail_text(event: dict[str, Any], stats: dict[str, Any]) -> str
             detail_text += f"\n… et {remaining} autre(s) type(s) de billet"
 
     detail_text += f"\n\n🎫 Billets restants : {event['left_tickets']}"
-    detail_text += f"\n⚡ Cache stats : {EVENT_STATS_CACHE_TTL}s"
+
+    event_url = get_event_url(event)
+    if event_url:
+        detail_text += f"\n🔗 Lien (appuie pour copier) :\n<code>{html.escape(event_url)}</code>"
+
+    detail_text += f"\n\n⚡ Cache stats : {EVENT_STATS_CACHE_TTL}s"
     detail_text += "\n⏱️ <i>Dernière mise à jour : à l'instant</i>"
     return detail_text
 
