@@ -86,6 +86,16 @@ def is_recent_event(event: dict[str, Any]) -> bool:
     return dt < datetime.now(timezone.utc)
 
 
+def get_event_url(event: dict[str, Any]) -> str | None:
+    url = event.get("url")
+    if url:
+        return url
+    slug = event.get("slug")
+    if slug:
+        return f"https://shotgun.live/events/{slug}"
+    return None
+
+
 def progress_bar(current: int, total: int, width: int = 10) -> str:
     if total <= 0:
         return "░" * width
@@ -187,6 +197,8 @@ class BotStateStore:
             "end_time": event.get("end_time"),
             "left_tickets": event.get("left_tickets", 0),
             "visibility": event.get("visibility"),
+            "slug": event.get("slug"),
+            "url": get_event_url(event),
             "last_seen_at": datetime.utcnow().isoformat(timespec="seconds"),
         }
         if snapshot is not None:
@@ -259,6 +271,7 @@ class ShotgunClient:
                 if not event.get("publishedAt") or not event.get("launchedAt"):
                     continue
 
+                slug = event.get("slug")
                 events.append(
                     {
                         "id": event["id"],
@@ -267,6 +280,8 @@ class ShotgunClient:
                         "end_time": event.get("endTime"),
                         "left_tickets": event.get("leftTicketsCount", 0),
                         "visibility": event.get("visibility"),
+                        "slug": slug,
+                        "url": event.get("url") or (f"https://shotgun.live/events/{slug}" if slug else None),
                     }
                 )
 
@@ -481,6 +496,8 @@ def build_archived_event_record(event: dict[str, Any], snapshot: dict[str, Any] 
         "end_time": event.get("end_time"),
         "left_tickets": event.get("left_tickets", 0),
         "visibility": event.get("visibility"),
+        "slug": event.get("slug"),
+        "url": get_event_url(event),
         "snapshot": snapshot or {},
         "archived_at": datetime.utcnow().isoformat(timespec="seconds"),
     }
@@ -922,7 +939,11 @@ async def event_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await safe_edit_message(query, exc.user_message)
         return
 
-    keyboard = [
+    keyboard = []
+    event_url = get_event_url(event)
+    if event_url:
+        keyboard.append([InlineKeyboardButton("🎟️ Voir l'événement", url=event_url)])
+    keyboard += [
         [InlineKeyboardButton("🔄 Actualiser", callback_data=f"refresh_evt_{event_id}")],
         [InlineKeyboardButton("🔙 Liste des événements", callback_data="list_events")],
         [InlineKeyboardButton("🏠 Menu Principal", callback_data="start")],
