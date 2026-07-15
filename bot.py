@@ -4,8 +4,9 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
@@ -24,6 +25,10 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SHOTGUN_TOKEN = os.getenv("SHOTGUN_TOKEN")
 ORGANIZER_ID = os.getenv("SHOTGUN_ORGANIZER_ID")
+# Un événement est considéré « co-organisé » quand ce marqueur apparaît dans
+# le nom/slug de son organisateur hôte (par défaut le lieu « palmeraie »).
+# S'il est absent, l'événement est « pas co-organisé » et sera signalé.
+COORG_MARKER = os.getenv("SHOTGUN_COORG_MARKER", "palmeraie").strip().lower()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,6 +46,9 @@ MAX_HTTP_RETRIES = 3
 MAX_DEAL_LINES = 12
 SALES_POLL_INTERVAL = 60
 RECENT_EVENTS_LIMIT = 8
+PARIS_TZ = ZoneInfo("Europe/Paris")
+# Heure de la vérification quotidienne « co-organisation » (heure de Paris).
+COHOST_CHECK_TIME = dt_time(hour=9, minute=0, tzinfo=PARIS_TZ)
 STATE_FILE = os.path.join(os.path.dirname(__file__), "bot_state.json")
 ALLOWED_CHAT_IDS = {
     int(chat_id.strip())
@@ -86,6 +94,13 @@ def is_recent_event(event: dict[str, Any]) -> bool:
     return dt < datetime.now(timezone.utc)
 
 
+def is_ended_event(event: dict[str, Any]) -> bool:
+    dt = parse_dt(event.get("end_time")) or parse_dt(event.get("start_time"))
+    if dt is None:
+        return False
+    return dt < datetime.now(timezone.utc)
+
+
 def get_event_url(event: dict[str, Any]) -> str | None:
     url = event.get("url")
     if url:
@@ -94,6 +109,18 @@ def get_event_url(event: dict[str, Any]) -> str | None:
     if slug:
         return f"https://shotgun.live/events/{slug}"
     return None
+
+
+def is_coorganized(event: dict[str, Any]) -> bool:
+    """Un événement est co-organisé quand le marqueur du lieu (ex. « palmeraie »)
+    apparaît dans son organisateur hôte. Sinon il est « pas co-organisé » et
+    sera signalé (hôte inconnu inclus)."""
+    haystack = (
+        f"{event.get('name') or ''} "
+        f"{event.get('organizer_name') or ''} "
+        f"{event.get('organizer_slug') or ''}"
+    ).lower()
+    return COORG_MARKER in haystack
 
 
 def progress_bar(current: int, total: int, width: int = 10) -> str:
@@ -123,6 +150,7 @@ class BotStateStore:
                 "event_snapshots": {},
                 "event_catalog": {},
                 "archived_events": {},
+                "recaps_sent": [],
             }
 
         try:
@@ -132,6 +160,7 @@ class BotStateStore:
                 payload.setdefault("event_snapshots", {})
                 payload.setdefault("event_catalog", {})
                 payload.setdefault("archived_events", {})
+                payload.setdefault("recaps_sent", [])
                 return payload
         except (OSError, json.JSONDecodeError):
             logger.warning("State file unreadable, recreating %s", self.path)
@@ -140,6 +169,7 @@ class BotStateStore:
                 "event_snapshots": {},
                 "event_catalog": {},
                 "archived_events": {},
+                "recaps_sent": [],
             }
 
     async def save(self) -> None:
@@ -220,6 +250,17 @@ class BotStateStore:
         self._state.setdefault("archived_events", {})[str(event_id)] = event_data
         await self.save()
 
+    def recap_already_sent(self, event_id: str) -> bool:
+        return str(event_id) in set(self._state.get("recaps_sent", []))
+
+    async def mark_recap_sent(self, event_id: str) -> None:
+        sent = set(self._state.get("recaps_sent", []))
+        if str(event_id) in sent:
+            return
+        sent.add(str(event_id))
+        self._state["recaps_sent"] = sorted(sent)
+        await self.save()
+
 
 class ShotgunClient:
     def __init__(self, token: str, organizer_id: str):
@@ -272,6 +313,7 @@ class ShotgunClient:
                     continue
 
                 slug = event.get("slug")
+                organizer = event.get("organizer") or {}
                 events.append(
                     {
                         "id": event["id"],
@@ -282,6 +324,8 @@ class ShotgunClient:
                         "visibility": event.get("visibility"),
                         "slug": slug,
                         "url": event.get("url") or (f"https://shotgun.live/events/{slug}" if slug else None),
+                        "organizer_name": organizer.get("name"),
+                        "organizer_slug": organizer.get("slug"),
                     }
                 )
 
@@ -319,6 +363,8 @@ class ShotgunClient:
                 "scanned": 0,
                 "canceled": 0,
                 "revenue": 0.0,
+                "paid_sold": 0,
+                "paid_scanned": 0,
                 "by_deal": {},
                 "pages": 0,
             }
@@ -365,6 +411,10 @@ class ShotgunClient:
                         stats["revenue"] += deal_price
                         deal_stats["sold"] += 1
                         deal_stats["revenue"] += deal_price
+                        if deal_price > 0:
+                            stats["paid_sold"] += 1
+                            if status == "scanned":
+                                stats["paid_scanned"] += 1
 
                 next_url = payload.get("pagination", {}).get("next")
                 params = None
@@ -480,7 +530,9 @@ def compute_event_snapshot(event: dict[str, Any], stats: dict[str, Any]) -> dict
     return {
         "name": event["name"],
         "sold": sold,
+        "paid_sold": stats.get("paid_sold", sold),
         "scanned": stats["scanned"],
+        "paid_scanned": stats.get("paid_scanned", stats["scanned"]),
         "canceled": stats["canceled"],
         "revenue": round(stats["revenue"], 2),
         "left_tickets": event["left_tickets"],
@@ -526,7 +578,16 @@ async def log_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(application: Application) -> None:
     application.bot_data["shotgun_client"] = ShotgunClient(SHOTGUN_TOKEN, ORGANIZER_ID)
-    application.bot_data["state_store"] = BotStateStore(STATE_FILE)
+    store = BotStateStore(STATE_FILE)
+    application.bot_data["state_store"] = store
+
+    # Évite un envoi rétroactif de récaps : tout événement déjà terminé au
+    # démarrage est marqué comme "récap envoyé". Seuls les événements qui se
+    # terminent après le lancement du bot déclencheront un récap.
+    for event_id, catalog_entry in list(store._state.get("event_catalog", {}).items()):
+        if is_ended_event(catalog_entry) and not store.recap_already_sent(event_id):
+            await store.mark_recap_sent(event_id)
+
     logger.info("Shotgun client initialized")
 
 
@@ -579,27 +640,26 @@ async def monitor_sales(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         snapshot = compute_event_snapshot(event, stats)
         next_snapshots[event_id] = snapshot
-        await store.upsert_event_catalog_entry(event, snapshot, stats)
         previous = store.get_event_snapshot(event_id)
+        await store.upsert_event_catalog_entry(event, snapshot, stats)
         if previous is None:
             if is_recent_event(event):
                 await store.archive_event(event_id, build_archived_event_record(event, stats))
             continue
 
-        sold_delta = snapshot["sold"] - int(previous.get("sold", 0))
+        previous_paid_sold = int(previous.get("paid_sold", snapshot["paid_sold"]))
+        paid_sold_delta = snapshot["paid_sold"] - previous_paid_sold
         revenue_delta = round(snapshot["revenue"] - float(previous.get("revenue", 0.0)), 2)
-        scanned_delta = snapshot["scanned"] - int(previous.get("scanned", 0))
+        previous_paid_scanned = int(previous.get("paid_scanned", snapshot["paid_scanned"]))
+        paid_scanned_delta = snapshot["paid_scanned"] - previous_paid_scanned
 
-        if sold_delta <= 0 and revenue_delta <= 0 and scanned_delta <= 0:
+        if paid_sold_delta <= 0 and revenue_delta <= 0 and paid_scanned_delta <= 0:
             continue
 
         notifications.append(
             (
-                f"🚀 <b>{html.escape(snapshot['name'])}</b>\n"
-                f"Billets vendus : +{sold_delta}\n"
-                f"Scannés : +{scanned_delta}\n"
-                f"CA : +{format_eur(max(revenue_delta, 0.0))}\n"
-                f"Restants : {snapshot['left_tickets']}"
+                f"🎟️ <b>{html.escape(snapshot['name'])}</b>\n"
+                f"+{max(paid_sold_delta, 0)} billet(s) · +{format_eur(max(revenue_delta, 0.0))}"
             )
         )
 
@@ -631,10 +691,113 @@ async def monitor_sales(context: ContextTypes.DEFAULT_TYPE) -> None:
                 "end_time": catalog_entry.get("end_time"),
                 "left_tickets": catalog_entry.get("left_tickets", 0),
                 "visibility": catalog_entry.get("visibility"),
+                "slug": catalog_entry.get("slug"),
+                "url": catalog_entry.get("url"),
                 "snapshot": snapshot,
                 "archived_at": datetime.utcnow().isoformat(timespec="seconds"),
             },
         )
+
+    # Récap de fin d'événement : dès qu'un événement est terminé, on envoie
+    # un récapitulatif final aux abonnés (une seule fois par événement).
+    for event_id, catalog_entry in list(store._state.get("event_catalog", {}).items()):
+        if not is_ended_event(catalog_entry) or store.recap_already_sent(event_id):
+            continue
+
+        # Récupère les stats finales fraîches (l'événement n'est plus dans la
+        # liste active, ses stats en cache sont figées au moment du lancement).
+        stats = None
+        try:
+            stats = await client.get_event_stats(event_id, force_refresh=True)
+        except ShotgunAPIError as exc:
+            logger.warning("Recap stats refresh failed for %s: %s", event_id, exc)
+
+        if not stats:
+            stats = catalog_entry.get("stats")
+        if not stats:
+            snapshot = store.get_event_snapshot(event_id) or catalog_entry.get("snapshot", {})
+            stats = {
+                "valid": int(snapshot.get("sold", 0)),
+                "scanned": int(snapshot.get("scanned", 0)),
+                "canceled": int(snapshot.get("canceled", 0)),
+                "revenue": float(snapshot.get("revenue", 0.0)),
+                "by_deal": {},
+            }
+
+        await notify_subscribers(context.application, build_event_recap_text(catalog_entry, stats))
+        await store.mark_recap_sent(event_id)
+
+
+def build_cohost_alert_text(uncoorganized: list[dict[str, Any]]) -> str:
+    if not uncoorganized:
+        return "✅ Tous tes événements à venir sont co-organisés."
+
+    lines = [
+        f"⚠️ <b>{len(uncoorganized)} événement(s) PAS co-organisé(s)</b>\n"
+        f"(le lieu « {html.escape(COORG_MARKER)} » n'est pas l'hôte)\n"
+    ]
+    for event in uncoorganized:
+        lines.append(
+            f"\n• <b>{html.escape(event['name'])}</b>\n"
+            f"🗓️ {format_event_date(event.get('start_time'))}\n"
+            f"👤 Hôte : {html.escape(event.get('organizer_name') or '—')}"
+        )
+        url = get_event_url(event)
+        if url:
+            lines.append(f"\n<code>{html.escape(url)}</code>")
+    return "".join(lines)
+
+
+async def find_uncoorganized_events(client: ShotgunClient) -> list[dict[str, Any]]:
+    events = await client.get_active_events(force_refresh=True)
+    return [event for event in events if not is_coorganized(event)]
+
+
+async def daily_cohost_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    client = get_shotgun_client(context)
+    try:
+        uncoorganized = await find_uncoorganized_events(client)
+    except ShotgunAPIError as exc:
+        logger.warning("Daily cohost check failed: %s", exc)
+        return
+
+    if not uncoorganized:
+        logger.info("Daily cohost check: all upcoming events are co-organized")
+        return
+
+    logger.info("Daily cohost check: %s event(s) not co-organized", len(uncoorganized))
+    await notify_subscribers(context.application, build_cohost_alert_text(uncoorganized))
+
+
+async def cohost_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+
+    query = update.callback_query
+    if query:
+        await answer_query_safely(query, "Vérification de la co-organisation...")
+
+    client = get_shotgun_client(context)
+    try:
+        uncoorganized = await find_uncoorganized_events(client)
+    except ShotgunAPIError as exc:
+        if query:
+            await safe_edit_message(query, exc.user_message)
+        else:
+            await update.message.reply_text(exc.user_message)
+        return
+
+    text = build_cohost_alert_text(uncoorganized)
+    keyboard = [
+        [InlineKeyboardButton("🔄 Actualiser", callback_data="cohost")],
+        [InlineKeyboardButton("🏠 Menu Principal", callback_data="start")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await safe_edit_message(query, text, reply_markup=reply_markup, parse_mode="HTML")
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -644,6 +807,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
         [InlineKeyboardButton("📅 Mes Événements", callback_data="list_events")],
         [InlineKeyboardButton("📈 Dashboard", callback_data="dashboard")],
+        [InlineKeyboardButton("🤝 Co-organisation", callback_data="cohost")],
         [InlineKeyboardButton("🕘 Anciens", callback_data="recent_events")],
         [InlineKeyboardButton("🔔 Notifications", callback_data="notifications")],
         [InlineKeyboardButton("ℹ️ Aide", callback_data="help")],
@@ -792,6 +956,41 @@ def build_event_detail_text(event: dict[str, Any], stats: dict[str, Any]) -> str
     return detail_text
 
 
+def build_event_recap_text(event: dict[str, Any], stats: dict[str, Any]) -> str:
+    sold = int(stats.get("valid", 0)) + int(stats.get("scanned", 0))
+    recap = (
+        f"🏁 <b>Événement terminé</b>\n"
+        f"🎉 <b>{html.escape(event.get('name') or '—')}</b>\n"
+        f"🗓️ {format_event_date(event.get('start_time'))}\n\n"
+        f"📊 <b>Récap final :</b>\n"
+        f"🎟️ Billets vendus : {sold}\n"
+        f"🔍 Scannés : {stats.get('scanned', 0)}\n"
+        f"❌ Annulés : {stats.get('canceled', 0)}\n"
+        f"💰 <b>Revenus totaux : {format_eur(stats.get('revenue', 0.0))}</b>\n"
+    )
+
+    by_deal = stats.get("by_deal") or {}
+    if by_deal:
+        recap += "\n🎫 <b>Détails par type de billet :</b>\n"
+        sorted_deals = sorted(
+            by_deal.items(),
+            key=lambda item: (-item[1]["revenue"], -item[1]["sold"], item[0].lower()),
+        )
+        for deal_name, deal_stats in sorted_deals[:MAX_DEAL_LINES]:
+            recap += f"\n• <b>{html.escape(deal_name)}</b>\n"
+            recap += f"Vendus : {deal_stats['sold']} | CA : {format_eur(deal_stats['revenue'])}\n"
+        remaining = len(sorted_deals) - MAX_DEAL_LINES
+        if remaining > 0:
+            recap += f"\n… et {remaining} autre(s) type(s) de billet"
+
+    event_url = get_event_url(event)
+    if event_url:
+        recap += f"\n\n🔗 {html.escape(event_url)}"
+
+    recap += "\n\n👋 Merci et à la prochaine !"
+    return recap
+
+
 def build_dashboard_text(events_with_stats: list[tuple[dict[str, Any], dict[str, Any]]]) -> str:
     total_events = len(events_with_stats)
     total_sold = 0
@@ -890,7 +1089,8 @@ async def notifications_panel(update: Update, context: ContextTypes.DEFAULT_TYPE
         "🔔 <b>Notifications</b>\n\n"
         f"Etat du chat : {'abonné' if is_subscribed else 'non abonné'}\n"
         f"Intervalle de surveillance : {SALES_POLL_INTERVAL}s\n"
-        "Le bot envoie un message quand il détecte de nouvelles ventes, scans ou une hausse du CA."
+        "Le bot envoie un message quand il détecte de nouvelles ventes ou scans payants. "
+        "Les billets à 0 € sont ignorés."
     )
     keyboard = [
         [
@@ -974,6 +1174,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "et Actualiser pour forcer un refresh API.\n\n"
         "Commandes utiles :\n"
         "/dashboard\n"
+        "/cohost\n"
         "/recent\n"
         "/health\n"
         "/notifications\n"
@@ -1134,9 +1335,11 @@ def main() -> None:
     if application.job_queue is not None:
         application.job_queue.run_repeating(warm_events_cache, interval=60, first=5)
         application.job_queue.run_repeating(monitor_sales, interval=SALES_POLL_INTERVAL, first=10)
+        application.job_queue.run_daily(daily_cohost_check, time=COHOST_CHECK_TIME)
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("dashboard", dashboard))
+    application.add_handler(CommandHandler("cohost", cohost_check))
     application.add_handler(CommandHandler("recent", recent_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("health", health_command))
@@ -1146,6 +1349,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(start, pattern="^start$"))
     application.add_handler(CallbackQueryHandler(list_events, pattern="^(list_events|refresh_events)$"))
     application.add_handler(CallbackQueryHandler(dashboard, pattern="^(dashboard|refresh_dashboard)$"))
+    application.add_handler(CallbackQueryHandler(cohost_check, pattern="^cohost$"))
     application.add_handler(CallbackQueryHandler(recent_events, pattern="^(recent_events|refresh_recent_events)$"))
     application.add_handler(CallbackQueryHandler(notifications_panel, pattern="^notifications$"))
     application.add_handler(CallbackQueryHandler(subscribe_callback, pattern="^subscribe_me$"))
